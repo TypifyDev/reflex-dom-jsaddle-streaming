@@ -1,150 +1,178 @@
 {-# LANGUAGE FlexibleContexts    #-}
 {-# LANGUAGE LambdaCase          #-}
 {-# LANGUAGE ScopedTypeVariables #-}
--- | Four FRP-shaping primitives over
--- 'Servant.Client.JSaddle.Streaming.sendStreamingRequest'. Each takes
--- a 'ClientEnv', a servant 'Request', a per-line parser
--- @(ByteString -> Maybe v)@, and a trigger 'Event'. They share one
--- assumption: the wire is newline-framed (matches servant's
--- 'NewlineFraming'). Each complete @\\n@-terminated line is fed to the
--- parser; the typed @v@ then flows through whichever Reflex shape the
--- pattern names.
+-- | Four FRP-shaping primitives over typed servant streaming calls.
 --
--- The four patterns:
+-- Each function takes a 'ClientEnv' and a 'ClientM (SourceIO v)' — the
+-- exact shape produced by 'client (Proxy @api)' for a streaming
+-- endpoint — and bridges its values into a Reflex shape:
 --
---   * 'performMessageEvent'      — 'Event t v', one firing per message.
---   * 'performCollectedMessages' — 'Event t (Maybe [v])', one firing
---                                  at stream end with the full list.
---   * 'performMessageProgress'   — 'Dynamic t (StreamObjectProgress v)',
---                                  cumulative state + lifecycle.
---   * 'performParsedStream'      — 'Dynamic t [v]', cumulative list.
+--   * 'performStreamEvent'         — 'Event t v', one firing per chunk
+--   * 'performStreamCollected'     — 'Event t (Maybe [v])', once at end
+--   * 'performStreamProgress'      — 'Dynamic t (StreamObjectProgress v)'
+--   * 'performStreamAccumulating'  — 'Dynamic t [v]'
 --
--- Use 'Just' as the parser to get raw lines as 'ByteString'.
+-- All four delegate framing + decoding to servant — the API type
+-- (its 'FramingUnrender' + 'MimeUnrender' instances) determines how
+-- bytes become @v@s. The Reflex bridge stays out of the parsing.
+--
+-- Implementation: each trigger fork a thread that calls 'runClientM'
+-- (which, via servant-jsaddle's progressive @RunStreamingClient ClientM@
+-- instance, returns a 'SourceIO v' backed by a bounded queue of XHR
+-- chunks). The thread drains the source, firing per-Yield callbacks
+-- into Reflex via 'newTriggerEvent'. Stays off the widget event loop.
 module Reflex.Dom.JSaddleStreaming
-  ( -- * Accumulated-state types (used by 'performMessageProgress')
+  ( -- * State types (used by 'performStreamProgress')
     StreamObjectProgress (..)
   , StreamStatus (..)
   , emptyProgress
 
     -- * Patterns
-  , performMessageEvent
-  , performCollectedMessages
-  , performMessageProgress
-  , performParsedStream
+  , performStreamEvent
+  , performStreamCollected
+  , performStreamProgress
+  , performStreamAccumulating
   ) where
 
-import Control.Monad (forM_, unless)
-import Control.Monad.Fix (MonadFix)
-import Control.Monad.IO.Class (liftIO)
-import qualified Data.ByteString as BS
-import Data.IORef (modifyIORef', newIORef, readIORef, writeIORef)
-import qualified Data.Maybe as Maybe
-import Data.Text (Text)
+import Control.Concurrent          (forkIO)
+import Control.Monad               (void)
+import Control.Monad.Fix           (MonadFix)
+import Control.Monad.IO.Class      (liftIO)
+import Data.IORef                  (modifyIORef', newIORef, readIORef)
+import Data.Text                   (Text)
+import qualified Data.Text         as T
+import qualified GHCJS.DOM.Types   as JS
 import Language.Javascript.JSaddle (MonadJSM, liftJSM)
-import Reflex hiding (Request)
-import Servant.Client.Core (Request)
-import Servant.Client.JSaddle (ClientEnv)
-import Servant.Client.JSaddle.Streaming
-  (StreamEvent (..), sendStreamingRequest)
+import Reflex
+import Servant.Client.JSaddle      (ClientEnv, ClientM, runClientM)
+-- Re-imported for its orphan 'RunStreamingClient ClientM' instance —
+-- without this import the typed streaming client falls back to no
+-- instance and fails to typecheck downstream.
+import Servant.Client.JSaddle.Streaming ()
+import qualified Servant.Types.SourceT as ST
 
 -- ────────────────────────────────────────────────────────────────────
 -- Accumulated-state types
 -- ────────────────────────────────────────────────────────────────────
 
 data StreamStatus
-  = Loading
-  | Done
-  | Errored !Text
+  = Loading                    -- ^ Stream open, values arriving.
+  | Done                       -- ^ Stream completed cleanly.
+  | Errored !Text              -- ^ Network / decode error.
   deriving (Show, Eq)
 
 data StreamObjectProgress v = StreamObjectProgress
-  { _sop_messages   :: ![v]
-  , _sop_httpStatus :: !(Maybe Word)
-  , _sop_status     :: !StreamStatus
+  { _sop_messages :: ![v]
+  , _sop_status   :: !StreamStatus
   } deriving (Show, Eq)
 
 emptyProgress :: StreamObjectProgress v
-emptyProgress = StreamObjectProgress [] Nothing Loading
+emptyProgress = StreamObjectProgress [] Loading
 
 -- ────────────────────────────────────────────────────────────────────
--- Pattern 1 — per-message Event
+-- Internal: drain a typed servant stream into a callback
 -- ────────────────────────────────────────────────────────────────────
 
--- | Fire one Reflex 'Event' per parsed message. Lines that fail to
--- parse are silently dropped. Lifecycle events (done / error) are not
--- exposed — reach for 'performMessageProgress' if you care about them.
-performMessageEvent
+-- | Lifecycle events delivered by 'withStream' to its callback.
+data StreamMsg v
+  = StreamVal !v        -- ^ One value from the stream.
+  | StreamFin           -- ^ Stream completed cleanly.
+  | StreamErr !Text     -- ^ Error from servant client or mid-stream.
+
+-- | Fork a thread that runs a typed servant streaming action and
+-- drains the resulting 'SourceIO', invoking the callback once per
+-- 'Yield' plus a final 'StreamFin' or 'StreamErr'.
+--
+-- The callback runs in IO on the forked thread; use it to fire
+-- Reflex 'newTriggerEvent' callbacks or write to refs.
+withStream
+  :: ClientEnv
+  -> ClientM (ST.SourceT IO v)
+  -> (StreamMsg v -> IO ())
+  -> JS.DOM ()
+withStream env action fire = do
+  domc <- JS.askDOM
+  liftIO . void . forkIO $ do
+    result <- flip JS.runDOM domc $ runClientM action env
+    case result of
+      Left err     -> fire (StreamErr (T.pack (show err)))
+      Right source -> drainSource fire source `andThen` fire StreamFin
+  where
+    andThen io after = io >> after
+
+-- | Step through a 'SourceT IO' once and fire the callback per Yield.
+-- 'Error' steps end the drain; 'Stop' ends it cleanly. The caller is
+-- responsible for emitting 'StreamFin' / 'StreamErr' around this.
+drainSource :: (StreamMsg v -> IO ()) -> ST.SourceT IO v -> IO ()
+drainSource fire (ST.SourceT k) = k go
+  where
+    go = \case
+      ST.Stop        -> pure ()
+      ST.Error e     -> fire (StreamErr (T.pack e))
+      ST.Skip s      -> go s
+      ST.Effect ms   -> ms >>= go
+      ST.Yield v s   -> fire (StreamVal v) >> go s
+
+-- ────────────────────────────────────────────────────────────────────
+-- Pattern 1 — per-value Event
+-- ────────────────────────────────────────────────────────────────────
+
+-- | Fire one Reflex 'Event' per value the stream produces.
+-- Lifecycle events (done / error) are silently dropped — reach for
+-- 'performStreamProgress' if you care about them.
+performStreamEvent
   :: ( PerformEvent t m
      , TriggerEvent t m
      , MonadJSM (Performable m)
      )
   => ClientEnv
-  -> Request
-  -> (BS.ByteString -> Maybe v)  -- ^ per-line parser
-  -> Event t a                   -- ^ trigger
+  -> ClientM (ST.SourceT IO v)   -- ^ typed servant streaming call
+  -> Event t a                 -- ^ trigger
   -> m (Event t v)
-performMessageEvent env req parser trigE = do
+performStreamEvent env action trigE = do
   (vE, fireV) <- newTriggerEvent
-  performEvent_ $ ffor trigE $ \_ -> liftJSM $ do
-    bufRef <- liftIO (newIORef BS.empty)
-    sendStreamingRequest env req $ \case
-      StreamChunk c -> liftIO $ do
-        buf <- readIORef bufRef
-        let (newBuf, lines_) = newlineSplit buf c
-        writeIORef bufRef newBuf
-        forM_ lines_ $ \line -> case parser line of
-          Just v  -> fireV v
-          Nothing -> pure ()
-      _ -> pure ()
+  performEvent_ $ ffor trigE $ \_ -> liftJSM $
+    withStream env action $ \case
+      StreamVal v -> fireV v
+      _           -> pure ()
   pure vE
 
 -- ────────────────────────────────────────────────────────────────────
--- Pattern 2 — one-shot complete list via performEventAsync
+-- Pattern 2 — one-shot complete-list Event
 -- ────────────────────────────────────────────────────────────────────
 
--- | Buffer messages until the stream completes, then fire exactly one
--- Reflex 'Event' with the full list. 'Nothing' means network error.
-performCollectedMessages
+-- | Buffer values until the stream completes, then fire exactly one
+-- Reflex 'Event' with the full list. 'Nothing' indicates an error.
+performStreamCollected
   :: ( PerformEvent t m
      , TriggerEvent t m
      , MonadJSM (Performable m)
      )
   => ClientEnv
-  -> Request
-  -> (BS.ByteString -> Maybe v)
+  -> ClientM (ST.SourceT IO v)
   -> Event t a
   -> m (Event t (Maybe [v]))
-performCollectedMessages env req parser trigE =
+performStreamCollected env action trigE =
   performEventAsync $ ffor trigE $ \_ fire -> liftJSM $ do
-    bufRef  <- liftIO (newIORef BS.empty)
-    msgsRef <- liftIO (newIORef ([] :: [v]))
-    sendStreamingRequest env req $ \case
-      StreamChunk c -> liftIO $ do
+    bufRef <- liftIO (newIORef [])
+    withStream env action $ \case
+      StreamVal v -> modifyIORef' bufRef (v:)
+      StreamFin   -> do
         buf <- readIORef bufRef
-        let (newBuf, lines_) = newlineSplit buf c
-            parsed           = Maybe.mapMaybe parser lines_
-        writeIORef bufRef newBuf
-        modifyIORef' msgsRef (<> parsed)
-      StreamDone _ -> liftIO $ do
-        msgs <- readIORef msgsRef
-        fire (Just msgs)
-      StreamFail _ -> liftIO (fire Nothing)
+        fire (Just (reverse buf))
+      StreamErr _ -> fire Nothing
 
 -- ────────────────────────────────────────────────────────────────────
 -- Pattern 3 — live Dynamic of accumulated state
 -- ────────────────────────────────────────────────────────────────────
 
--- Internal: split the lifecycle into a single sum so we can foldDyn
--- over it cleanly.
-data ProgressEvent v
-  = PEMessages ![v]
-  | PEDone     !Word
-  | PEFailed   !Text
+-- Internal: fold a stream of StreamMsg into the progress record.
+data ProgressEv v
+  = PEVal !v
+  | PEFin
+  | PEErr !Text
 
--- | foldDyn over StreamEvents into a 'StreamObjectProgress v'. The
--- Dynamic ticks once per parsed message and once per lifecycle
--- transition.
-performMessageProgress
+performStreamProgress
   :: ( PerformEvent t m
      , TriggerEvent t m
      , MonadHold t m
@@ -152,65 +180,38 @@ performMessageProgress
      , MonadJSM (Performable m)
      )
   => ClientEnv
-  -> Request
-  -> (BS.ByteString -> Maybe v)
+  -> ClientM (ST.SourceT IO v)
   -> Event t a
   -> m (Dynamic t (StreamObjectProgress v))
-performMessageProgress env req parser trigE = do
-  (evtE, fire) <- newTriggerEvent
-  performEvent_ $ ffor trigE $ \_ -> liftJSM $ do
-    bufRef <- liftIO (newIORef BS.empty)
-    sendStreamingRequest env req $ \case
-      StreamChunk c -> liftIO $ do
-        buf <- readIORef bufRef
-        let (newBuf, lines_) = newlineSplit buf c
-            parsed           = Maybe.mapMaybe parser lines_
-        writeIORef bufRef newBuf
-        unless (null parsed) $ fire (PEMessages parsed)
-      StreamDone s -> liftIO (fire (PEDone (fromIntegral s)))
-      StreamFail e -> liftIO (fire (PEFailed e))
-  let step (PEMessages msgs) sop =
-        sop { _sop_messages = _sop_messages sop <> msgs }
-      step (PEDone s) sop =
-        sop { _sop_httpStatus = Just s, _sop_status = Done }
-      step (PEFailed e) sop =
-        sop { _sop_status = Errored e }
-  foldDyn step emptyProgress evtE
+performStreamProgress env action trigE = do
+  (evE, fire) <- newTriggerEvent
+  performEvent_ $ ffor trigE $ \_ -> liftJSM $
+    withStream env action $ \case
+      StreamVal v -> fire (PEVal v)
+      StreamFin   -> fire PEFin
+      StreamErr e -> fire (PEErr e)
+  let step (PEVal v) sop = sop { _sop_messages = _sop_messages sop ++ [v] }
+      step PEFin     sop = sop { _sop_status = Done }
+      step (PEErr e) sop = sop { _sop_status = Errored e }
+  foldDyn step emptyProgress evE
 
 -- ────────────────────────────────────────────────────────────────────
 -- Pattern 4 — accumulating Dynamic [v]
 -- ────────────────────────────────────────────────────────────────────
 
--- | Cumulative list of parsed messages. Equivalent to
--- @fmap _sop_messages . performMessageProgress@ for callers that don't
--- need the lifecycle status.
-performParsedStream
-  :: forall t m v a.
-     ( PerformEvent t m
+-- | Cumulative list of values. Lifecycle is ignored; use
+-- 'performStreamProgress' if you need it.
+performStreamAccumulating
+  :: ( PerformEvent t m
      , TriggerEvent t m
      , MonadHold t m
      , MonadFix m
      , MonadJSM (Performable m)
      )
   => ClientEnv
-  -> Request
-  -> (BS.ByteString -> Maybe v)
+  -> ClientM (ST.SourceT IO v)
   -> Event t a
   -> m (Dynamic t [v])
-performParsedStream env req parser trigE = do
-  msgE <- performMessageEvent env req parser trigE
-  foldDyn (\v acc -> acc ++ [v]) [] msgE
-
--- ────────────────────────────────────────────────────────────────────
--- Internal helper
--- ────────────────────────────────────────────────────────────────────
-
--- | Append @chunk@ to @buf@, split off complete (newline-terminated)
--- lines, return @(remaining-partial-line, complete-lines)@.
-newlineSplit :: BS.ByteString -> BS.ByteString -> (BS.ByteString, [BS.ByteString])
-newlineSplit buf chunk =
-  let combined = buf <> chunk
-      pieces   = BS.split 10 combined
-  in case reverse pieces of
-       []       -> (BS.empty, [])
-       lst:rev  -> (lst, reverse rev)
+performStreamAccumulating env action trigE = do
+  vE <- performStreamEvent env action trigE
+  foldDyn (\v acc -> acc ++ [v]) [] vE

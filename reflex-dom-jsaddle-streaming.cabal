@@ -3,15 +3,16 @@ name:               reflex-dom-jsaddle-streaming
 version:            0.1.0.0
 synopsis:           Reflex FRP shapes over servant-jsaddle progressive streaming
 description:
-  Four reusable functions that bridge
-  'Servant.Client.JSaddle.Streaming.sendStreamingRequest' (the
-  JSaddle-native XHR callback primitive) into different Reflex shapes
-  (per-message Event, one-shot complete Event, live Dynamic of
-  accumulated state, cumulative Dynamic of all values). All four are
-  polymorphic in the parsed message type; pass a
-  @ByteString -> Maybe v@ parser to control decoding. The framing
-  assumed on the wire is newline-delimited
-  (servant\'s @NewlineFraming@).
+  Four reusable functions that bridge a typed servant streaming call —
+  @ClientM (SourceIO v)@ — into different Reflex shapes:
+  per-value 'Event', one-shot complete-list 'Event', live 'Dynamic' of
+  accumulated state, and cumulative 'Dynamic' list. Framing and
+  decoding come from servant's 'FramingUnrender' + 'MimeUnrender'
+  instances via the API type; no manual parser argument required.
+  .
+  Built on top of servant-jsaddle\'s progressive 'RunStreamingClient'
+  instance, which bridges the async XHR push model into 'SourceIO''s
+  sync-pull model.
 license:            BSD-3-Clause
 author:             you
 maintainer:         you
@@ -25,10 +26,10 @@ library
       Reflex.Dom.JSaddleStreaming
   build-depends:
       base                  >= 4.14 && < 5
-    , bytestring
+    , ghcjs-dom
     , jsaddle
     , mtl
     , reflex
-    , servant-client-core
+    , servant
     , servant-jsaddle
     , text
