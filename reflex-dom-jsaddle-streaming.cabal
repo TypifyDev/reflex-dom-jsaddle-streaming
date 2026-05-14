@@ -33,3 +33,4 @@ library
     , servant
     , servant-jsaddle
     , text
+    , lens
